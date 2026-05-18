@@ -4,7 +4,6 @@ readonly RCLOAK_DB_FILE="${RCLOAK_DATA_DIR}/rcloak.db"
 
 db_init() {
     mkdir -p "$(dirname "$RCLOAK_DB_FILE")"
-    [[ -f "$RCLOAK_DB_FILE" ]] && return 0
 
     sqlite3 "$RCLOAK_DB_FILE" << 'SQL'
 CREATE TABLE IF NOT EXISTS backups (
@@ -100,4 +99,15 @@ SELECT
     COUNT(DISTINCT job_name)
 FROM backups;
 SQL
+}
+
+db_delete_backup() {
+    sqlite3 "$RCLOAK_DB_FILE" "DELETE FROM backups WHERE id=$1;"
+}
+
+db_delete_expired() {
+    local job_name="$1" retention_days="$2"
+    [[ "$retention_days" == "0" || "$retention_days" == "null" ]] && return 0
+    sqlite3 "$RCLOAK_DB_FILE" \
+        "DELETE FROM backups WHERE job_name='${job_name}' AND completed_at < datetime('now', '-${retention_days} days');"
 }

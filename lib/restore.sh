@@ -4,6 +4,16 @@ restore_interactive() {
     echo ""
     echo -e "  ${_CLR_BOLD}Restore Backup${_CLR_RESET}"
 
+    # Prune expired records from DB based on retention config
+    if config_exists; then
+        local _jobs_json
+        _jobs_json=$(jq -r '.jobs[] | "\(.name)|\(.retention_days)"' "$RCLOAK_CONFIG_FILE" 2>/dev/null || true)
+        while IFS='|' read -r _jname _jret; do
+            [[ -n "$_jname" && -n "$_jret" && "$_jret" != "0" && "$_jret" != "null" ]] && \
+                db_delete_expired "$_jname" "$_jret"
+        done <<< "$_jobs_json"
+    fi
+
     local count
     count=$(db_count)
     if [[ "$count" -eq 0 ]]; then

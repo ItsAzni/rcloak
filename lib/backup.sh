@@ -85,6 +85,12 @@ backup_run_job() {
             "$compressed_flag" "$archive_used" "success" "" \
             "$(date -Iseconds -d @$start_time 2>/dev/null || date -Iseconds)" "$(date -Iseconds)"
         echo "${job_name}|success|${duration_str}|${size_str}" >> "/tmp/rcloak_results.$$"
+
+        # Auto-cleanup: delete old backups from remote and DB based on retention
+        if [[ "$retention" != "null" && "$retention" != "0" && -n "$retention" ]]; then
+            rclone delete "$dest" --min-age "${retention}d" 2>/dev/null || true
+            db_delete_expired "$job_name" "$retention"
+        fi
     else
         config_update_job_status "$job_name" "failed"
         local error_detail
