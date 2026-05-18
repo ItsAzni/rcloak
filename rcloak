@@ -1,0 +1,979 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+readonly SCRIPT_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+
+source "${SCRIPT_DIR}/lib/logger.sh"
+source "${SCRIPT_DIR}/lib/utils.sh"
+source "${SCRIPT_DIR}/lib/config.sh"
+source "${SCRIPT_DIR}/lib/notify.sh"
+source "${SCRIPT_DIR}/lib/backup.sh"
+source "${SCRIPT_DIR}/lib/db.sh"
+source "${SCRIPT_DIR}/lib/restore.sh"
+
+_init_logger
+ensure_dirs
+db_init
+
+cleanup() { tput cnorm 2>/dev/null || true; release_lock 2>/dev/null || true; }
+trap cleanup EXIT
+
+cmd_help() {
+    ui_banner
+    echo -e "  ${_CLR_BOLD}Usage:${_CLR_RESET} rcloak <command> [options]"
+    echo ""
+    echo -e "  ${_CLR_BOLD}Commands:${_CLR_RESET}"
+    echo -e "    ${_CLR_CYAN}setup${_CLR_RESET}        Interactive setup wizard"
+    echo -e "    ${_CLR_CYAN}add${_CLR_RESET}          Add a backup job"
+    echo -e "    ${_CLR_CYAN}remove${_CLR_RESET}       Remove a backup job"
+    echo -e "    ${_CLR_CYAN}edit${_CLR_RESET}         Edit a backup job"
+    echo -e "    ${_CLR_CYAN}list${_CLR_RESET}         List all backup jobs"
+    echo -e "    ${_CLR_CYAN}run${_CLR_RESET}          Execute backup jobs"
+    echo -e "    ${_CLR_CYAN}status${_CLR_RESET}       Show backup history & status"
+    echo -e "    ${_CLR_CYAN}schedule${_CLR_RESET}     Setup cron schedule"
+    echo -e "    ${_CLR_CYAN}notify${_CLR_RESET}       Configure notifications"
+    echo -e "    ${_CLR_CYAN}test-notify${_CLR_RESET}  Test notification delivery"
+    echo -e "    ${_CLR_CYAN}config${_CLR_RESET}       Show current configuration"
+    echo -e "    ${_CLR_CYAN}cleanup${_CLR_RESET}      Remove old backups (retention)"
+    echo -e "    ${_CLR_CYAN}restore${_CLR_RESET}      Restore a backup"
+    echo -e "    ${_CLR_CYAN}history${_CLR_RESET}      Show backup history"
+    echo -e "    ${_CLR_CYAN}sync-db${_CLR_RESET}      Sync config & DB to remote ${_CLR_DIM}[-r remote:]${_CLR_RESET}"
+    echo -e "    ${_CLR_CYAN}import-db${_CLR_RESET}    Import DB from remote ${_CLR_DIM}[-r remote:]${_CLR_RESET}"
+    echo -e "    ${_CLR_CYAN}set-remote${_CLR_RESET}   Set default sync remote ${_CLR_DIM}[-r remote:]${_CLR_RESET}"
+    echo -e "    ${_CLR_CYAN}update${_CLR_RESET}       Self-update to latest version ${_CLR_DIM}[--force]${_CLR_RESET}"
+    echo ""
+    echo -e "  ${_CLR_BOLD}Options:${_CLR_RESET}"
+    echo -e "    ${_CLR_DIM}-h, --help${_CLR_RESET}      Show this help"
+    echo -e "    ${_CLR_DIM}-v, --version${_CLR_RESET}   Show version"
+    echo -e "    ${_CLR_DIM}--verbose, -V${_CLR_RESET}   Debug output"
+    echo -e "    ${_CLR_DIM}--no-color${_CLR_RESET}      Disable colors"
+    echo -e "    ${_CLR_DIM}--json${_CLR_RESET}          Output as JSON"
+    echo -e "    ${_CLR_DIM}--dry-run${_CLR_RESET}       Simulate without changes"
+    echo ""
+    echo -e "  ${_CLR_DIM}Run 'rcloak <command> --help' for command details.${_CLR_RESET}"
+    echo ""
+}
+
+cmd_version() {
+    echo -e "  ⚡ ${_CLR_CYAN}rcloak${_CLR_RESET} v${RCLOAK_VERSION}"
+}
+
+cmd_update() {
+    local force=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force|-f) force=true; shift ;;
+            --help|-h) echo -e "  Usage: rcloak update [--force]"; return 0 ;;
+            *) log_error "Unknown option: $1"; return 1 ;;
+        esac
+    done
+
+    echo ""
+    log_info "Checking for updates..."
+
+    # Get latest version from GitHub
+    local latest_version
+    latest_version=$(curl -fsSL https://api.github.com/repos/itsazni/rcloak/releases/latest 2>/dev/null | jq -r '.tag_name' 2>/dev/null || echo "")
+
+    # Fallback: get from main branch if no releases
+    if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
+        latest_version=$(curl -fsSL https://raw.githubusercontent.com/itsazni/rcloak/main/lib/utils.sh 2>/dev/null | grep "RCLOAK_VERSION=" | head -1 | grep -oP '[\d.]+' || echo "")
+    fi
+
+    if [[ -z "$latest_version" ]]; then
+        log_error "Could not check for updates. Try again later or use --force to reinstall."
+        return 1
+    fi
+
+    # Strip 'v' prefix if present
+    latest_version="${latest_version#v}"
+
+    if [[ "$latest_version" == "$RCLOAK_VERSION" && "$force" != "true" ]]; then
+        log_success "Already on the latest version: v${RCLOAK_VERSION}"
+        return 0
+    fi
+
+    if [[ "$force" == "true" ]]; then
+        log_info "Force reinstalling rcloak..."
+    else
+        log_info "New version available: v${latest_version} (current: v${RCLOAK_VERSION})"
+    fi
+
+    ui_confirm "Proceed with update?" "y" || return 0
+
+    log_info "Downloading latest version..."
+
+    # Run install script
+    if curl -fsSL https://raw.githubusercontent.com/itsazni/rcloak/main/install.sh | bash; then
+        echo ""
+        log_success "rcloak updated to v${latest_version}"
+        log_info "Run 'rcloak version' to verify"
+    else
+        log_error "Update failed. Please try manually:"
+        echo -e "  ${_CLR_DIM}curl -fsSL https://raw.githubusercontent.com/itsazni/rcloak/main/install.sh | bash${_CLR_RESET}"
+        return 1
+    fi
+}
+
+cmd_setup() {
+    ui_banner
+    echo -e "  ${_CLR_BOLD}Setup Wizard${_CLR_RESET}"
+    echo -e "  ${_CLR_DIM}Configure rcloak step by step${_CLR_RESET}"
+
+    ui_step 1 5 "Checking dependencies"
+
+    log_info "Checking dependencies..."
+    if ! check_dependencies; then
+        log_error "Please install missing dependencies and try again."
+        exit 1
+    fi
+    log_success "All dependencies found"
+
+    ui_step 2 5 "Rclone remotes"
+
+    local remotes
+    remotes=$(rclone listremotes 2>/dev/null || echo "")
+    if [[ -z "$remotes" ]]; then
+        log_warn "No rclone remotes configured."
+        if ui_confirm "Configure a remote now?"; then
+            rclone config
+            remotes=$(rclone listremotes 2>/dev/null || echo "")
+        else
+            echo -e "  ${_CLR_CYAN}┃${_CLR_RESET} ${_CLR_DIM}Run 'rclone config' later to add a remote.${_CLR_RESET}"
+        fi
+    else
+        echo ""
+        echo -e "  ${_CLR_CYAN}┃${_CLR_RESET} ${_CLR_BOLD}Available remotes:${_CLR_RESET}"
+        echo "$remotes" | while read -r remote; do
+            echo -e "  ${_CLR_CYAN}┃${_CLR_RESET}   ${_CLR_GREEN}●${_CLR_RESET} ${remote}"
+        done
+    fi
+
+    ui_step 3 5 "Configuration"
+
+    config_init
+    log_success "Config ready at ${_CLR_DIM}${RCLOAK_CONFIG_FILE}${_CLR_RESET}"
+
+    ui_step 4 5 "Notifications"
+
+    if ui_confirm "Setup Discord notifications?"; then
+        ui_prompt "Discord Webhook URL"
+        local webhook_url="$__UI_RESULT"
+        if [[ -n "$webhook_url" ]]; then
+            config_set_str '.notifications.discord.webhook_url' "$webhook_url"
+            config_set '.notifications.discord.enabled' 'true'
+            log_success "Discord enabled"
+        fi
+    fi
+
+
+
+    ui_step 5 5 "First backup job"
+
+    if ui_confirm "Add your first backup job?"; then
+        _interactive_add_job
+    fi
+
+    echo ""
+    echo -e "  ${_CLR_GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${_CLR_RESET}"
+    echo -e "  ${_CLR_GREEN}┃${_CLR_RESET} ${_CLR_BOLD}✓ Setup complete!${_CLR_RESET}"
+    echo -e "  ${_CLR_GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${_CLR_RESET}"
+    echo ""
+    echo -e "  ${_CLR_BOLD}Next steps:${_CLR_RESET}"
+    echo -e "    ${_CLR_CYAN}rcloak run${_CLR_RESET}        Run backup now"
+    echo -e "    ${_CLR_CYAN}rcloak schedule${_CLR_RESET}   Setup auto schedule"
+    echo -e "    ${_CLR_CYAN}rcloak add${_CLR_RESET}        Add more jobs"
+    echo ""
+}
+
+_interactive_add_job() {
+    local name source dest compress retention
+
+    # Job name
+    ui_prompt "Job name (e.g. website, database, photos)"
+    name="$__UI_RESULT"
+    if [[ -z "$name" ]]; then
+        log_error "Job name is required"
+        return 1
+    fi
+
+    # Source path
+    ui_prompt "Source path (file or directory to backup)"
+    source="$__UI_RESULT"
+    if [[ -z "$source" ]]; then
+        log_error "Source path is required"
+        return 1
+    fi
+
+    # Destination - show available remotes
+    local remotes
+    remotes=$(rclone listremotes 2>/dev/null | tr -d ' ' || echo "")
+    if [[ -n "$remotes" ]]; then
+        local remote_arr=()
+        while IFS= read -r r; do
+            [[ -n "$r" ]] && remote_arr+=("$r")
+        done <<< "$remotes"
+
+        if [[ ${#remote_arr[@]} -eq 1 ]]; then
+            echo ""
+            echo -e "  ${_CLR_CYAN}┃${_CLR_RESET} ${_CLR_DIM}Using remote: ${remote_arr[0]}${_CLR_RESET}"
+            ui_prompt "Destination path (e.g. ${remote_arr[0]}backups/${name})"
+        elif [[ ${#remote_arr[@]} -gt 1 ]]; then
+            ui_select "Choose remote" "${remote_arr[@]}"
+            local chosen_remote="$__UI_RESULT"
+            ui_prompt "Destination path (e.g. ${chosen_remote}backups/${name})"
+        fi
+    else
+        ui_prompt "Destination (e.g. remote:backups/mydata)"
+    fi
+    dest="$__UI_RESULT"
+    if [[ -z "$dest" ]]; then
+        log_error "Destination is required"
+        return 1
+    fi
+
+    # Compress
+    if ui_confirm "Compress before upload? (tar.gz)" "n"; then
+        compress="true"
+    else
+        compress="false"
+    fi
+
+    # Retention
+    ui_prompt "Keep backups for how many days? (0 = forever)" "30"
+    retention="$__UI_RESULT"
+
+    # Add the job
+    config_add_job "$name" "$source" "$dest" "$compress" "$retention"
+}
+
+cmd_add() {
+    config_init
+
+    # Check for CLI arguments
+    local name="" source="" dest="" compress="" retention=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) [[ $# -lt 2 ]] && { log_error "--name requires a value"; return 1; }; name="$2"; shift 2 ;;
+            --source) [[ $# -lt 2 ]] && { log_error "--source requires a value"; return 1; }; source="$2"; shift 2 ;;
+            --dest) [[ $# -lt 2 ]] && { log_error "--dest requires a value"; return 1; }; dest="$2"; shift 2 ;;
+            --compress) compress="true"; shift ;;
+            --retention) [[ $# -lt 2 ]] && { log_error "--retention requires a value"; return 1; }; retention="$2"; shift 2 ;;
+            --help|-h) echo -e "  Usage: rcloak add [--name <n>] [--source <path>] [--dest <remote:path>] [--compress] [--retention <days>]"; return 0 ;;
+            *) log_error "Unknown option: $1. See 'rcloak add --help'"; return 1 ;;
+        esac
+    done
+
+    # If all required args provided, skip interactive
+    if [[ -n "$name" && -n "$source" && -n "$dest" ]]; then
+        [[ -z "$compress" ]] && compress="false"
+        [[ -z "$retention" ]] && retention="30"
+        config_add_job "$name" "$source" "$dest" "$compress" "$retention"
+        return
+    fi
+
+    # Interactive mode
+    echo ""
+    echo -e "  ${_CLR_BOLD}Add Backup Job${_CLR_RESET}"
+    _interactive_add_job
+}
+
+cmd_remove() {
+    config_init
+    local name="${1:-}"
+
+    if [[ -z "$name" ]]; then
+        # Show jobs and let user pick
+        local jobs=()
+        mapfile -t jobs < <(jq -r '.jobs[].name' "$RCLOAK_CONFIG_FILE" 2>/dev/null)
+
+        if [[ ${#jobs[@]} -eq 0 ]]; then
+            log_info "No jobs to remove."
+            return 0
+        fi
+
+        ui_select "Which job to remove?" "${jobs[@]}"
+        name="$__UI_RESULT"
+    fi
+
+    if ui_confirm "Remove job '${name}'?" "n"; then
+        config_remove_job "$name"
+    fi
+}
+
+cmd_edit() {
+    config_init
+    local name="${1:-}"
+
+    while true; do
+    if [[ -z "$name" ]]; then
+        local jobs=()
+        mapfile -t jobs < <(jq -r '.jobs[].name' "$RCLOAK_CONFIG_FILE" 2>/dev/null)
+        if [[ ${#jobs[@]} -eq 0 ]]; then
+            log_info "No jobs to edit."
+            return 0
+        fi
+        ui_select "Which job to edit?" "${jobs[@]}"
+        name="$__UI_RESULT"
+    fi
+
+    local job
+    job=$(config_get_job "$name")
+    if [[ -z "$job" || "$job" == "null" ]]; then
+        log_error "Job '${name}' not found"
+        return 1
+    fi
+
+    local cur_source cur_dest cur_compress cur_retention cur_enabled
+    cur_source=$(echo "$job" | jq -r '.source')
+    cur_dest=$(echo "$job" | jq -r '.dest')
+    cur_compress=$(echo "$job" | jq -r '.compress')
+    cur_retention=$(echo "$job" | jq -r '.retention_days')
+    cur_enabled=$(echo "$job" | jq -r '.enabled')
+
+    echo ""
+    echo -e "  ${_CLR_BOLD}Edit Job:${_CLR_RESET} ${_CLR_CYAN}${name}${_CLR_RESET}"
+
+    ui_select "What to edit?" \
+        "Source path" \
+        "Destination" \
+        "Compression (current: ${cur_compress})" \
+        "Retention days (current: ${cur_retention})" \
+        "Enabled (current: ${cur_enabled})" \
+        "Rename job"
+
+    local choice="$__UI_RESULT"
+    local tmp="${RCLOAK_CONFIG_FILE}.tmp"
+
+    case "$choice" in
+        "Source path")
+            ui_prompt "New source path" "$cur_source"
+            jq --arg name "$name" --arg val "$__UI_RESULT" \
+                '(.jobs[] | select(.name == $name)).source = $val' \
+                "$RCLOAK_CONFIG_FILE" > "$tmp" && mv "$tmp" "$RCLOAK_CONFIG_FILE"
+            log_success "Source updated"
+            ;;
+        "Destination")
+            ui_prompt "New destination" "$cur_dest"
+            jq --arg name "$name" --arg val "$__UI_RESULT" \
+                '(.jobs[] | select(.name == $name)).dest = $val' \
+                "$RCLOAK_CONFIG_FILE" > "$tmp" && mv "$tmp" "$RCLOAK_CONFIG_FILE"
+            log_success "Destination updated"
+            ;;
+        "Compression"*)
+            local new_val="true"
+            [[ "$cur_compress" == "true" ]] && new_val="false"
+            jq --arg name "$name" --argjson val "$new_val" \
+                '(.jobs[] | select(.name == $name)).compress = $val' \
+                "$RCLOAK_CONFIG_FILE" > "$tmp" && mv "$tmp" "$RCLOAK_CONFIG_FILE"
+            log_success "Compression: ${new_val}"
+            ;;
+        "Retention"*)
+            ui_prompt "Retention days (0 = forever)" "$cur_retention"
+            local days="$__UI_RESULT"
+            [[ ! "$days" =~ ^[0-9]+$ ]] && days=30
+            jq --arg name "$name" --argjson val "$days" \
+                '(.jobs[] | select(.name == $name)).retention_days = $val' \
+                "$RCLOAK_CONFIG_FILE" > "$tmp" && mv "$tmp" "$RCLOAK_CONFIG_FILE"
+            log_success "Retention: ${days} days"
+            ;;
+        "Enabled"*)
+            local new_val="true"
+            [[ "$cur_enabled" == "true" ]] && new_val="false"
+            jq --arg name "$name" --argjson val "$new_val" \
+                '(.jobs[] | select(.name == $name)).enabled = $val' \
+                "$RCLOAK_CONFIG_FILE" > "$tmp" && mv "$tmp" "$RCLOAK_CONFIG_FILE"
+            log_success "Enabled: ${new_val}"
+            ;;
+        "Rename job")
+            ui_prompt "New name" "$name"
+            local new_name="$__UI_RESULT"
+            jq --arg name "$name" --arg val "$new_name" \
+                '(.jobs[] | select(.name == $name)).name = $val' \
+                "$RCLOAK_CONFIG_FILE" > "$tmp" && mv "$tmp" "$RCLOAK_CONFIG_FILE"
+            log_success "Renamed: ${name} → ${new_name}"
+            name="$new_name"
+            ;;
+    esac
+
+    if ! ui_confirm "Edit something else?" "y"; then
+        break
+    fi
+    name=""
+    done
+}
+
+cmd_list() {
+    config_list_jobs
+}
+
+cmd_run() {
+    local job_name=""
+    local dry_run="false"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --job|-j) [[ $# -lt 2 ]] && { log_error "--job requires a value"; return 1; }; job_name="$2"; shift 2 ;;
+            --dry-run) dry_run="true"; shift ;;
+            --help|-h) echo -e "  Usage: rcloak run [--job <name>] [--dry-run]"; return 0 ;;
+            *) log_error "Unknown option: $1. See 'rcloak run --help'"; return 1 ;;
+        esac
+    done
+
+    if ! config_exists; then
+        log_error "No config found. Run 'rcloak setup' first."
+        exit 1
+    fi
+
+    if ! acquire_lock; then
+        exit 1
+    fi
+
+    if [[ -n "$job_name" ]]; then
+        echo ""
+        echo -e "  ${_CLR_BOLD}⚡ rcloak${_CLR_RESET} ${_CLR_DIM}— running job: ${job_name}${_CLR_RESET}"
+        echo ""
+
+        rm -f "/tmp/rcloak_results.$$"
+        local total_start
+        total_start=$(date +%s)
+
+        notify_backup_start "1" "$job_name"
+
+        local exit_code=0
+        if backup_run_job "$job_name" "$dry_run" "1" "1"; then
+            exit_code=0
+        else
+            exit_code=1
+        fi
+
+        local total_end total_duration
+        total_end=$(date +%s)
+        total_duration=$(elapsed_time $((total_end - total_start)))
+
+        wait
+        local job_results=()
+        if [[ -f "/tmp/rcloak_results.$$" ]]; then
+            mapfile -t job_results < "/tmp/rcloak_results.$$"
+            rm -f "/tmp/rcloak_results.$$"
+        fi
+
+        local total_size="unknown"
+        if [[ ${#job_results[@]} -gt 0 ]]; then
+            total_size=$(echo "${job_results[0]}" | cut -d'|' -f4)
+        fi
+
+        log_separator
+        if [[ $exit_code -eq 0 ]]; then
+            log_success "1 job completed · ${total_duration} · ${total_size}"
+        else
+            log_warn "1 job failed · ${total_duration}"
+        fi
+
+        local sc=0 fc=0
+        [[ $exit_code -eq 0 ]] && sc=1 || fc=1
+        notify_backup_summary "1" "$sc" "$fc" "$total_duration" "$total_size" "${job_results[@]}"
+    else
+        backup_run_all "$dry_run"
+    fi
+
+    release_lock
+}
+
+cmd_status() {
+    if ! config_exists; then
+        log_error "No config found. Run 'rcloak setup' first."
+        exit 1
+    fi
+
+    ui_banner
+    echo -e "  ${_CLR_BOLD}Backup Status${_CLR_RESET}"
+    echo ""
+
+    jq -r '.jobs[] | "\(.name)|\(.source)|\(.dest)|\(.enabled)|\(.last_run // "never")|\(.last_status // "never")"' "$RCLOAK_CONFIG_FILE" | \
+    while IFS='|' read -r name source dest enabled last_run last_status; do
+        local status_icon status_color
+        case "$last_status" in
+            success) status_icon="✓"; status_color="$_CLR_GREEN" ;;
+            failed)  status_icon="✗"; status_color="$_CLR_RED" ;;
+            *)       status_icon="○"; status_color="$_CLR_DIM" ;;
+        esac
+
+        echo -e "  ${status_color}${status_icon}${_CLR_RESET} ${_CLR_BOLD}${name}${_CLR_RESET}"
+        echo -e "    ${_CLR_DIM}Source:${_CLR_RESET}    ${source}"
+        echo -e "    ${_CLR_DIM}Dest:${_CLR_RESET}      ${dest}"
+        echo -e "    ${_CLR_DIM}Last run:${_CLR_RESET}  ${last_run}"
+        echo -e "    ${_CLR_DIM}Status:${_CLR_RESET}    ${status_color}${last_status}${_CLR_RESET}"
+        echo ""
+    done
+
+    # Show recent logs
+    echo -e "  ${_CLR_BOLD}Recent Logs${_CLR_RESET}"
+    local log_files
+    log_files=$(find "${RCLOAK_LOG_DIR}" -name "*.log" -type f 2>/dev/null | sort -r | head -5 || true)
+    if [[ -n "$log_files" ]]; then
+        echo "$log_files" | while read -r lf; do
+            echo -e "    ${_CLR_DIM}$(basename "$lf")${_CLR_RESET}"
+        done
+    else
+        echo -e "    ${_CLR_DIM}No logs yet${_CLR_RESET}"
+    fi
+    echo ""
+}
+
+cmd_schedule() {
+    local cron_expr=""
+    local job_name=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --cron) [[ $# -lt 2 ]] && { log_error "--cron requires a value"; return 1; }; cron_expr="$2"; shift 2 ;;
+            --job|-j) [[ $# -lt 2 ]] && { log_error "--job requires a value"; return 1; }; job_name="$2"; shift 2 ;;
+            --remove) _schedule_remove; return ;;
+            --help|-h) echo -e "  Usage: rcloak schedule [--cron <expr>] [--job <name>] [--remove]"; return 0 ;;
+            *) log_error "Unknown option: $1. See 'rcloak schedule --help'"; return 1 ;;
+        esac
+    done
+
+    if [[ -z "$cron_expr" ]]; then
+        echo ""
+        echo -e "  ${_CLR_BOLD}Schedule Backup${_CLR_RESET}"
+
+        ui_select "Choose schedule" \
+            "Every day at 2:00 AM" \
+            "Every 6 hours" \
+            "Every day at midnight" \
+            "Every Sunday at 3 AM" \
+            "Custom"
+
+        case "$__UI_RESULT" in
+            "Every day at 2:00 AM")    cron_expr="0 2 * * *" ;;
+            "Every 6 hours")           cron_expr="0 */6 * * *" ;;
+            "Every day at midnight")   cron_expr="0 0 * * *" ;;
+            "Every Sunday at 3 AM")    cron_expr="0 3 * * 0" ;;
+            "Custom")
+                ui_prompt "Cron expression (e.g. 0 2 * * *)"
+                cron_expr="$__UI_RESULT"
+                ;;
+        esac
+    fi
+
+    if [[ -z "$cron_expr" ]]; then
+        log_error "No schedule specified"
+        return 1
+    fi
+
+    local rcloak_path="${SCRIPT_DIR}/rcloak"
+    local run_cmd="${rcloak_path} run"
+    [[ -n "$job_name" ]] && run_cmd="${rcloak_path} run --job ${job_name}"
+
+    local cron_line="${cron_expr} ${run_cmd} >> ${RCLOAK_LOG_DIR}/cron.log 2>&1"
+
+    # Remove existing rcloak entries and add new one
+    (crontab -l 2>/dev/null | grep -v "rcloak"; echo "$cron_line") | crontab -
+
+    echo ""
+    log_success "Cron schedule installed"
+    echo -e "  ${_CLR_DIM}Schedule: ${cron_expr}${_CLR_RESET}"
+    echo -e "  ${_CLR_DIM}Command:  ${run_cmd}${_CLR_RESET}"
+    echo ""
+    echo -e "  ${_CLR_DIM}View: crontab -l${_CLR_RESET}"
+    echo -e "  ${_CLR_DIM}Remove: rcloak schedule --remove${_CLR_RESET}"
+    echo ""
+}
+
+_schedule_remove() {
+    crontab -l 2>/dev/null | grep -v "rcloak" | crontab -
+    log_success "Cron schedule removed"
+}
+
+cmd_notify() {
+    config_init
+
+    while true; do
+    echo ""
+    echo -e "  ${_CLR_BOLD}Notification Settings${_CLR_RESET}"
+
+    ui_select "What to configure?" \
+        "Discord webhook" \
+        "Toggle success notifications" \
+        "Toggle failure notifications" \
+        "Show current settings"
+
+    case "$__UI_RESULT" in
+        "Discord webhook")
+            ui_prompt "Discord Webhook URL"
+            local webhook_url="$__UI_RESULT"
+            if [[ -n "$webhook_url" ]]; then
+                config_set_str '.notifications.discord.webhook_url' "$webhook_url"
+                config_set '.notifications.discord.enabled' 'true'
+                log_success "Discord configured"
+            fi
+            ;;
+
+        "Toggle success notifications")
+            local current
+            current=$(config_get '.notifications.on_success')
+            if [[ "$current" == "true" ]]; then
+                config_set '.notifications.on_success' 'false'
+                log_info "Success notifications: ${_CLR_RED}disabled${_CLR_RESET}"
+            else
+                config_set '.notifications.on_success' 'true'
+                log_info "Success notifications: ${_CLR_GREEN}enabled${_CLR_RESET}"
+            fi
+            ;;
+        "Toggle failure notifications")
+            local current
+            current=$(config_get '.notifications.on_failure')
+            if [[ "$current" == "true" ]]; then
+                config_set '.notifications.on_failure' 'false'
+                log_info "Failure notifications: ${_CLR_RED}disabled${_CLR_RESET}"
+            else
+                config_set '.notifications.on_failure' 'true'
+                log_info "Failure notifications: ${_CLR_GREEN}enabled${_CLR_RESET}"
+            fi
+            ;;
+        "Show current settings")
+            echo ""
+            local discord_on on_success on_failure
+            discord_on=$(config_get '.notifications.discord.enabled')
+            on_success=$(config_get '.notifications.on_success')
+            on_failure=$(config_get '.notifications.on_failure')
+
+            echo -e "  ${_CLR_CYAN}┃${_CLR_RESET} ${_CLR_BOLD}Discord:${_CLR_RESET}      ${discord_on}"
+            echo -e "  ${_CLR_CYAN}┃${_CLR_RESET} ${_CLR_BOLD}On success:${_CLR_RESET}   ${on_success}"
+            echo -e "  ${_CLR_CYAN}┃${_CLR_RESET} ${_CLR_BOLD}On failure:${_CLR_RESET}   ${on_failure}"
+            echo ""
+            ;;
+    esac
+
+    if ! ui_confirm "Configure something else?" "y"; then
+        break
+    fi
+    done
+}
+
+cmd_test_notify() {
+    config_init
+    echo ""
+    log_info "Sending test notification..."
+
+    local dc_msg="🧪 **Test Notification**
+
+✅ Notifications are working!
+🖥 $(_host)"
+
+    notify_send "🧪 Test" "$dc_msg" "info"
+    log_success "Test notification sent"
+    echo ""
+}
+
+cmd_config() {
+    if ! config_exists; then
+        log_warn "No config found. Run 'rcloak setup' first."
+        return 1
+    fi
+
+    echo ""
+    echo -e "  ${_CLR_BOLD}Configuration${_CLR_RESET} ${_CLR_DIM}(${RCLOAK_CONFIG_FILE})${_CLR_RESET}"
+    echo ""
+    jq '.' "$RCLOAK_CONFIG_FILE" | sed 's/^/  /'
+    echo ""
+}
+
+cmd_cleanup() {
+    local job_name="${1:-}"
+
+    if ! config_exists; then
+        log_error "No config found. Run 'rcloak setup' first."
+        exit 1
+    fi
+
+    if [[ -n "$job_name" ]]; then
+        backup_cleanup_old "$job_name"
+    else
+        local jobs
+        mapfile -t jobs < <(config_get_all_jobs)
+        for j in "${jobs[@]}"; do
+            backup_cleanup_old "$j"
+        done
+    fi
+}
+
+cmd_restore() {
+    local job_name=""
+    local restore_path=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --job|-j) [[ $# -lt 2 ]] && { log_error "--job requires a value"; return 1; }; job_name="$2"; shift 2 ;;
+            --to) [[ $# -lt 2 ]] && { log_error "--to requires a value"; return 1; }; restore_path="$2"; shift 2 ;;
+            --help|-h) echo -e "  Usage: rcloak restore [--job <name>] [--to <path>]"; return 0 ;;
+            *) log_error "Unknown option: $1. See 'rcloak restore --help'"; return 1 ;;
+        esac
+    done
+
+    if [[ -n "$job_name" ]]; then
+        restore_by_job "$job_name" "$restore_path"
+    else
+        restore_interactive
+    fi
+}
+
+cmd_history() {
+    local job_name="${1:-}"
+    local limit="${2:-20}"
+
+    echo ""
+    echo -e "  ${_CLR_BOLD}Backup History${_CLR_RESET}"
+    echo ""
+
+    local count
+    count=$(db_count 2>/dev/null || echo "0")
+    if [[ "$count" -eq 0 ]]; then
+        log_info "No backup history yet."
+        return 0
+    fi
+
+    # Stats
+    local stats
+    stats=$(db_stats)
+    local total success failed total_bytes hosts jobs
+    total=$(echo "$stats" | cut -d'|' -f1)
+    success=$(echo "$stats" | cut -d'|' -f2)
+    failed=$(echo "$stats" | cut -d'|' -f3)
+    total_bytes=$(echo "$stats" | cut -d'|' -f4)
+    hosts=$(echo "$stats" | cut -d'|' -f5)
+    jobs=$(echo "$stats" | cut -d'|' -f6)
+
+    local total_size
+    total_size=$(human_size "${total_bytes:-0}")
+
+    echo -e "  ${_CLR_DIM}${total} backups · ${success} success · ${failed} failed · ${total_size} total · ${hosts} host(s)${_CLR_RESET}"
+    echo ""
+
+    # List recent backups
+    while IFS='|' read -r id name hostname size duration status completed; do
+        local icon
+        case "$status" in
+            success) icon="${_CLR_GREEN}✓${_CLR_RESET}" ;;
+            failed)  icon="${_CLR_RED}✗${_CLR_RESET}" ;;
+            *)       icon="${_CLR_DIM}○${_CLR_RESET}" ;;
+        esac
+        echo -e "  ${icon} ${_CLR_BOLD}${name}${_CLR_RESET} · ${size} · ${duration} · ${_CLR_DIM}${completed} · ${hostname}${_CLR_RESET}"
+    done < <(db_list_backups "$job_name" "$limit")
+    echo ""
+}
+
+cmd_sync_db() {
+    local remote=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --remote|-r) [[ $# -lt 2 ]] && { log_error "--remote requires a value"; return 1; }; remote="$2"; shift 2 ;;
+            --help|-h) echo -e "  Usage: rcloak sync-db [--remote <remote:>]"; return 0 ;;
+            *) log_error "Unknown option: $1. Use --remote <remote:> to specify remote."; return 1 ;;
+        esac
+    done
+
+    if [[ -z "$remote" ]]; then
+        remote=$(_resolve_sync_remote)
+        [[ -z "$remote" ]] && return 1
+    fi
+
+    # Build sync path
+    remote="${remote%/}"
+    [[ "$remote" == *: ]] && remote="${remote}rcloak-sync/" || remote="${remote}/rcloak-sync/"
+
+    echo ""
+    log_info "Syncing rcloak data to ${remote}"
+
+    if [[ -f "$RCLOAK_CONFIG_FILE" ]]; then
+        rclone copy "$RCLOAK_CONFIG_FILE" "${remote}config/" 2>/dev/null
+        log_success "Config synced"
+    fi
+
+    if [[ -f "$RCLOAK_DB_FILE" ]]; then
+        rclone copy "$RCLOAK_DB_FILE" "${remote}data/" 2>/dev/null
+        log_success "Database synced"
+    fi
+
+    log_success "Sync complete → ${remote}"
+    echo ""
+}
+
+cmd_import_db() {
+    local remote=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --remote|-r) [[ $# -lt 2 ]] && { log_error "--remote requires a value"; return 1; }; remote="$2"; shift 2 ;;
+            --help|-h) echo -e "  Usage: rcloak import-db [--remote <remote:>]"; return 0 ;;
+            *) log_error "Unknown option: $1. Use --remote <remote:> to specify remote."; return 1 ;;
+        esac
+    done
+
+    if [[ -z "$remote" ]]; then
+        remote=$(_resolve_sync_remote)
+        [[ -z "$remote" ]] && return 1
+    fi
+
+    # Build sync path
+    remote="${remote%/}"
+    [[ "$remote" == *: ]] && remote="${remote}rcloak-sync/" || remote="${remote}/rcloak-sync/"
+
+    echo ""
+    log_info "Importing rcloak data from ${remote}"
+
+    # Download database (merge)
+    local tmp_dir="/tmp/rcloak_import_$$"
+    mkdir -p "$tmp_dir"
+    local tmp_db="${tmp_dir}/rcloak.db"
+    if rclone copy "${remote}data/" "$tmp_dir/" 2>/dev/null && [[ -f "$tmp_db" ]]; then
+        # Merge: import records from remote DB that don't exist locally
+        sqlite3 "$RCLOAK_DB_FILE" "ATTACH '${tmp_db}' AS import_db;
+INSERT OR IGNORE INTO backups (job_name, hostname, source, dest, remote_path, size_bytes, size_human, duration_secs, duration_human, compressed, archive_name, status, error_msg, started_at, completed_at)
+SELECT job_name, hostname, source, dest, remote_path, size_bytes, size_human, duration_secs, duration_human, compressed, archive_name, status, error_msg, started_at, completed_at
+FROM import_db.backups
+WHERE completed_at NOT IN (SELECT completed_at FROM backups);
+DETACH import_db;"
+        rm -rf "$tmp_dir"
+        log_success "Database imported & merged"
+    else
+        rm -rf "$tmp_dir"
+        log_warn "No remote database found at ${remote}data/"
+    fi
+
+    echo ""
+}
+
+_resolve_sync_remote() {
+    # Check if default remote is set in config
+    local default_remote=""
+    if config_exists; then
+        default_remote=$(config_get '.sync_remote // empty' 2>/dev/null || echo "")
+    fi
+
+    if [[ -n "$default_remote" && "$default_remote" != "null" ]]; then
+        echo "$default_remote"
+        return 0
+    fi
+
+    # Fallback: pick from available remotes
+    local remotes
+    remotes=$(rclone listremotes 2>/dev/null | tr -d ' ' || echo "")
+    if [[ -z "$remotes" ]]; then
+        log_error "No rclone remotes configured"
+        return 1
+    fi
+
+    local remote_arr=()
+    while IFS= read -r r; do
+        [[ -n "$r" ]] && remote_arr+=("$r")
+    done <<< "$remotes"
+
+    local remote=""
+    if [[ ${#remote_arr[@]} -eq 1 ]]; then
+        remote="${remote_arr[0]}"
+    else
+        ui_select "Choose remote" "${remote_arr[@]}"
+        remote="$__UI_RESULT"
+    fi
+
+    echo "$remote"
+}
+
+cmd_set_remote() {
+    config_init
+    local remote=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --remote|-r) [[ $# -lt 2 ]] && { log_error "--remote requires a value"; return 1; }; remote="$2"; shift 2 ;;
+            --help|-h) echo -e "  Usage: rcloak set-remote [--remote <remote:>]"; return 0 ;;
+            *) remote="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$remote" ]]; then
+        local remotes
+        remotes=$(rclone listremotes 2>/dev/null | tr -d ' ' || echo "")
+        if [[ -z "$remotes" ]]; then
+            log_error "No rclone remotes configured"
+            return 1
+        fi
+
+        local remote_arr=()
+        while IFS= read -r r; do
+            [[ -n "$r" ]] && remote_arr+=("$r")
+        done <<< "$remotes"
+
+        if [[ ${#remote_arr[@]} -eq 1 ]]; then
+            remote="${remote_arr[0]}"
+            log_info "Only one remote available, setting as default"
+        else
+            ui_select "Set default sync remote" "${remote_arr[@]}"
+            remote="$__UI_RESULT"
+        fi
+    fi
+
+    config_set_str '.sync_remote' "$remote"
+    log_success "Default sync remote: ${remote}"
+}
+
+
+main() {
+    # Handle global flags
+    local args=()
+    for arg in "$@"; do
+        case "$arg" in
+            --no-color)
+                RCLOAK_NO_COLOR="true"
+                _disable_colors
+                ;;
+            --verbose|-V)
+                RCLOAK_LOG_LEVEL="$LOG_LEVEL_DEBUG"
+                ;;
+            --json)
+                export RCLOAK_JSON_OUTPUT="true"
+                ;;
+            *)
+                args+=("$arg")
+                ;;
+        esac
+    done
+    set -- "${args[@]:-}"
+
+    local command="${1:-help}"
+    shift || true
+
+    case "$command" in
+        setup)       cmd_setup "$@" ;;
+        add)         cmd_add "$@" ;;
+        remove|rm)   cmd_remove "$@" ;;
+        edit)         cmd_edit "$@" ;;
+        list|ls)     cmd_list "$@" ;;
+        run)         cmd_run "$@" ;;
+        status|st)   cmd_status "$@" ;;
+        schedule)    cmd_schedule "$@" ;;
+        notify)      cmd_notify "$@" ;;
+        test-notify) cmd_test_notify "$@" ;;
+        config)      cmd_config "$@" ;;
+        cleanup)     cmd_cleanup "$@" ;;
+        restore)     cmd_restore "$@" ;;
+        history)     cmd_history "$@" ;;
+        sync-db|sync) cmd_sync_db "$@" ;;
+        import-db|import) cmd_import_db "$@" ;;
+        set-remote) cmd_set_remote "$@" ;;
+        -h|--help|help) cmd_help ;;
+        update|self-update) cmd_update "$@" ;;
+        -v|--version|version) cmd_version ;;
+        *)
+            log_error "Unknown command: ${command}"
+            echo -e "  ${_CLR_DIM}Run 'rcloak --help' for usage.${_CLR_RESET}"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
