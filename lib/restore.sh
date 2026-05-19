@@ -52,6 +52,11 @@ restore_interactive() {
     ui_prompt "Restore to path" "/tmp/restore-${sel_job}"
     local restore_path="$__UI_RESULT"
 
+    local clean_dest="n"
+    if ui_confirm "Clean destination before restore? (removes existing files in target)" "n"; then
+        clean_dest="y"
+    fi
+
     echo ""
     echo -e "  ${_CLR_CYAN}┃${_CLR_RESET} ${_CLR_BOLD}Restore Summary${_CLR_RESET}"
     echo -e "  ${_CLR_CYAN}┃${_CLR_RESET}   Job:    ${sel_job}"
@@ -59,19 +64,32 @@ restore_interactive() {
     echo -e "  ${_CLR_CYAN}┃${_CLR_RESET}   To:     ${restore_path}"
     echo -e "  ${_CLR_CYAN}┃${_CLR_RESET}   Size:   ${sel_size}"
     echo -e "  ${_CLR_CYAN}┃${_CLR_RESET}   Host:   ${sel_host}"
+    if [[ "$clean_dest" == "y" ]]; then
+        echo -e "  ${_CLR_CYAN}┃${_CLR_RESET}   Clean:  ${_CLR_YELLOW}YES (existing files will be removed)${_CLR_RESET}"
+    else
+        echo -e "  ${_CLR_CYAN}┃${_CLR_RESET}   Clean:  No (merge with existing files)"
+    fi
 
     if ! ui_confirm "Proceed with restore?" "y"; then
         log_info "Restore cancelled"
         return 0
     fi
 
-    restore_execute "$sel_dest" "$restore_path" "$sel_compressed" "$sel_archive"
+    restore_execute "$sel_dest" "$restore_path" "$sel_compressed" "$sel_archive" "$clean_dest"
 }
 
 restore_execute() {
-    local remote_path="$1" restore_path="$2" compressed="${3:-0}" archive_name="${4:-}"
+    local remote_path="$1" restore_path="$2" compressed="${3:-0}" archive_name="${4:-}" clean_dest="${5:-n}"
 
     mkdir -p "$restore_path"
+
+    # Clean destination if requested
+    if [[ "$clean_dest" == "y" ]]; then
+        log_info "Cleaning destination..."
+        rm -rf "${restore_path:?}"/*
+        rm -rf "${restore_path:?}"/.[!.]* 2>/dev/null || true
+    fi
+
     local start_time
     start_time=$(date +%s)
 
@@ -105,8 +123,8 @@ restore_execute() {
         fi
         rm -rf "$tmp_dir"
     else
-        log_info "Syncing from remote..."
-        if ! rclone sync "$remote_path" "$restore_path" --progress 2>&1 | tail -1; then
+        log_info "Copying from remote..."
+        if ! rclone copy "$remote_path" "$restore_path" --progress 2>&1 | tail -1; then
             log_error "Restore failed"
             return 1
         fi
@@ -134,13 +152,23 @@ restore_by_job() {
 
     [[ -z "$restore_path" ]] && restore_path="$sel_source"
 
+    local clean_dest="n"
+    if ui_confirm "Clean destination before restore? (removes existing files in target)" "n"; then
+        clean_dest="y"
+    fi
+
     echo ""
     echo -e "  ${_CLR_BOLD}Restore:${_CLR_RESET} ${job_name} (latest)"
     echo -e "  ${_CLR_DIM}From: ${sel_dest}${_CLR_RESET}"
     echo -e "  ${_CLR_DIM}To:   ${restore_path}${_CLR_RESET}"
     echo -e "  ${_CLR_DIM}Size: ${sel_size}${_CLR_RESET}"
+    if [[ "$clean_dest" == "y" ]]; then
+        echo -e "  ${_CLR_YELLOW}Clean: YES (existing files will be removed)${_CLR_RESET}"
+    else
+        echo -e "  ${_CLR_DIM}Clean: No (merge with existing files)${_CLR_RESET}"
+    fi
     echo ""
 
     ui_confirm "Proceed?" "y" || return 0
-    restore_execute "$sel_dest" "$restore_path" "$sel_compressed" "$sel_archive"
+    restore_execute "$sel_dest" "$restore_path" "$sel_compressed" "$sel_archive" "$clean_dest"
 }
