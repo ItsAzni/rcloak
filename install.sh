@@ -107,7 +107,23 @@ get_script_dir() {
 }
 
 do_install() {
+    local force="${1:-false}"
+
     banner
+
+    if [[ "$force" == "true" && -d "$INSTALL_DIR" ]]; then
+        info "Removing existing installation..."
+        run_cmd rm -rf "$INSTALL_DIR"
+    fi
+
+    if [[ "$force" == "true" ]]; then
+        if [[ -L "$BIN_LINK" || -f "$BIN_LINK" ]]; then
+            info "Removing existing binary link..."
+            run_cmd rm -f "$BIN_LINK"
+        fi
+    fi
+
+    mkdir -p "$(dirname "$BIN_LINK")"
 
     echo -e "  ${B}Dependencies${X}"
     echo ""
@@ -140,7 +156,8 @@ do_install() {
         success "Installed from local source"
     elif [[ -d "$INSTALL_DIR/.git" ]]; then
         cd "$INSTALL_DIR"
-        run_cmd git pull --quiet origin "$RCLOAK_BRANCH" 2>/dev/null || true
+        run_cmd git fetch --quiet origin "$RCLOAK_BRANCH"
+        run_cmd git reset --quiet --hard "origin/${RCLOAK_BRANCH}"
         success "Updated existing installation"
     else
         run_cmd git clone --quiet --depth 1 -b "$RCLOAK_BRANCH" "$RCLOAK_REPO" "$INSTALL_DIR"
@@ -203,7 +220,8 @@ do_uninstall() {
 }
 
 case "${1:-install}" in
-    install)   do_install ;;
+    install)   do_install false ;;
+    --force|force|reinstall) do_install true ;;
     uninstall) do_uninstall ;;
-    *) echo "Usage: install.sh [install|uninstall]"; exit 1 ;;
+    *) echo "Usage: install.sh [install|--force|uninstall]"; exit 1 ;;
 esac

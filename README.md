@@ -31,6 +31,9 @@ rcloak update
 
 # force reinstall (even if on latest)
 rcloak update --force
+
+# force reinstall directly from installer
+curl -fsSL https://raw.githubusercontent.com/itsazni/rcloak/main/install.sh | bash -s --force
 ```
 
 ## Usage

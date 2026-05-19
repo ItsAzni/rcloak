@@ -104,10 +104,25 @@ cmd_update() {
     log_info "Downloading latest version..."
 
     # Run install script
-    if curl -fsSL https://raw.githubusercontent.com/itsazni/rcloak/main/install.sh | bash; then
+    local install_arg="install"
+    [[ "$force" == "true" ]] && install_arg="--force"
+
+    if curl -fsSL https://raw.githubusercontent.com/itsazni/rcloak/main/install.sh | bash -s "$install_arg"; then
         echo ""
+        local installed_version="" installed_bin=""
+        installed_bin=$(command -v rcloak 2>/dev/null || true)
+        if [[ -n "$installed_bin" ]]; then
+            installed_version=$("$installed_bin" --version 2>/dev/null | grep -oP 'v\K[0-9.]+' | head -1 || true)
+        fi
+
+        if [[ -n "$installed_version" && "$installed_version" != "$latest_version" ]]; then
+            log_error "Update verification failed: expected v${latest_version}, got v${installed_version}"
+            log_info "Try: rcloak update --force"
+            return 1
+        fi
+
         log_success "rcloak updated to v${latest_version}"
-        log_info "Run 'rcloak version' to verify"
+        log_info "Run 'rcloak --version' to verify"
     else
         log_error "Update failed. Please try manually:"
         echo -e "  ${_CLR_DIM}curl -fsSL https://raw.githubusercontent.com/itsazni/rcloak/main/install.sh | bash${_CLR_RESET}"
