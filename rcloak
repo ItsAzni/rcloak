@@ -107,7 +107,7 @@ cmd_update() {
     local install_arg="install"
     [[ "$force" == "true" ]] && install_arg="--force"
 
-    if curl -fsSL https://raw.githubusercontent.com/itsazni/rcloak/main/install.sh | bash -s "$install_arg"; then
+    if curl -fsSL https://raw.githubusercontent.com/itsazni/rcloak/main/install.sh | bash -s -- "$install_arg"; then
         echo ""
         local installed_version="" installed_bin=""
         installed_bin=$(command -v rcloak 2>/dev/null || true)
