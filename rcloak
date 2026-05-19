@@ -804,13 +804,21 @@ cmd_sync_db() {
     log_info "Syncing rcloak data to ${remote}"
 
     if [[ -f "$RCLOAK_CONFIG_FILE" ]]; then
-        rclone copy "$RCLOAK_CONFIG_FILE" "${remote}config/" 2>/dev/null
-        log_success "Config synced"
+        if rclone copyto "$RCLOAK_CONFIG_FILE" "${remote}config/backup.json" 2>/dev/null; then
+            log_success "Config uploaded"
+        else
+            log_error "Config upload failed"
+            return 1
+        fi
     fi
 
     if [[ -f "$RCLOAK_DB_FILE" ]]; then
-        rclone copy "$RCLOAK_DB_FILE" "${remote}data/" 2>/dev/null
-        log_success "Database synced"
+        if rclone copyto "$RCLOAK_DB_FILE" "${remote}data/rcloak.db" 2>/dev/null; then
+            log_success "Database uploaded"
+        else
+            log_error "Database upload failed"
+            return 1
+        fi
     fi
 
     log_success "Sync complete → ${remote}"
@@ -840,23 +848,12 @@ cmd_import_db() {
     echo ""
     log_info "Importing rcloak data from ${remote}"
 
-    # Download database (merge)
-    local tmp_dir="/tmp/rcloak_import_$$"
-    mkdir -p "$tmp_dir"
-    local tmp_db="${tmp_dir}/rcloak.db"
-    if rclone copy "${remote}data/" "$tmp_dir/" 2>/dev/null && [[ -f "$tmp_db" ]]; then
-        # Merge: import records from remote DB that don't exist locally
-        sqlite3 "$RCLOAK_DB_FILE" "ATTACH '${tmp_db}' AS import_db;
-INSERT OR IGNORE INTO backups (job_name, hostname, source, dest, remote_path, size_bytes, size_human, duration_secs, duration_human, compressed, archive_name, status, error_msg, started_at, completed_at)
-SELECT job_name, hostname, source, dest, remote_path, size_bytes, size_human, duration_secs, duration_human, compressed, archive_name, status, error_msg, started_at, completed_at
-FROM import_db.backups
-WHERE completed_at NOT IN (SELECT completed_at FROM backups);
-DETACH import_db;"
-        rm -rf "$tmp_dir"
-        log_success "Database imported & merged"
+    # Download database
+    mkdir -p "$(dirname "$RCLOAK_DB_FILE")"
+    if rclone copyto "${remote}data/rcloak.db" "$RCLOAK_DB_FILE" 2>/dev/null; then
+        log_success "Database downloaded"
     else
-        rm -rf "$tmp_dir"
-        log_warn "No remote database found at ${remote}data/"
+        log_warn "No remote database found at ${remote}data/rcloak.db"
     fi
 
     echo ""

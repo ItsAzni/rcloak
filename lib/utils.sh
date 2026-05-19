@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-readonly RCLOAK_VERSION="1.0.2"
+readonly RCLOAK_VERSION="1.0.3"
 readonly RCLOAK_DIR="${RCLOAK_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
 if [[ $EUID -eq 0 ]]; then

@@ -140,7 +140,7 @@ rcloak sync-db
 # push to specific remote
 rcloak sync-db --remote mydrive:
 
-# pull db from remote (merges with local)
+# pull db from remote
 rcloak import-db
 
 # pull from specific remote
