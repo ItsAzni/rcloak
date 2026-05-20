@@ -171,6 +171,13 @@ cmd_setup() {
 
     ui_step 4 5 "Notifications"
 
+    ui_prompt "Server name (identifies this server in notifications)" "$(hostname 2>/dev/null || echo server)"
+    local server_name="$__UI_RESULT"
+    if [[ -n "$server_name" ]]; then
+        config_set_str '.server_name' "$server_name"
+        log_success "Server name: ${server_name}"
+    fi
+
     if ui_confirm "Setup Discord notifications?"; then
         ui_prompt "Discord Webhook URL"
         local webhook_url="$__UI_RESULT"
@@ -611,6 +618,7 @@ cmd_notify() {
 
     ui_select "What to configure?" \
         "Discord webhook" \
+        "Set server name" \
         "Toggle success notifications" \
         "Toggle failure notifications" \
         "Show current settings"
@@ -623,6 +631,19 @@ cmd_notify() {
                 config_set_str '.notifications.discord.webhook_url' "$webhook_url"
                 config_set '.notifications.discord.enabled' 'true'
                 log_success "Discord configured"
+            fi
+            ;;
+
+        "Set server name")
+            local cur_server
+            cur_server=$(config_get '.server_name // empty' 2>/dev/null || echo "")
+            [[ "$cur_server" == "null" || "$cur_server" == "empty" ]] && cur_server=""
+            local default_hint="${cur_server:-$(hostname 2>/dev/null || echo server)}"
+            ui_prompt "Server name (shown in Discord notifications)" "$default_hint"
+            local server_name="$__UI_RESULT"
+            if [[ -n "$server_name" ]]; then
+                config_set_str '.server_name' "$server_name"
+                log_success "Server name set to: ${server_name}"
             fi
             ;;
 
@@ -650,11 +671,13 @@ cmd_notify() {
             ;;
         "Show current settings")
             echo ""
-            local discord_on on_success on_failure
+            local discord_on on_success on_failure cur_server
             discord_on=$(config_get '.notifications.discord.enabled')
             on_success=$(config_get '.notifications.on_success')
             on_failure=$(config_get '.notifications.on_failure')
-
+            cur_server=$(config_get '.server_name // empty' 2>/dev/null || echo "")
+            [[ "$cur_server" == "null" || "$cur_server" == "empty" || -z "$cur_server" ]] && cur_server="$(hostname 2>/dev/null || echo server) (default)"
+            echo -e "  ${_CLR_CYAN}┃${_CLR_RESET} ${_CLR_BOLD}Server name:${_CLR_RESET}  ${cur_server}"
             echo -e "  ${_CLR_CYAN}┃${_CLR_RESET} ${_CLR_BOLD}Discord:${_CLR_RESET}      ${discord_on}"
             echo -e "  ${_CLR_CYAN}┃${_CLR_RESET} ${_CLR_BOLD}On success:${_CLR_RESET}   ${on_success}"
             echo -e "  ${_CLR_CYAN}┃${_CLR_RESET} ${_CLR_BOLD}On failure:${_CLR_RESET}   ${on_failure}"
@@ -673,13 +696,27 @@ cmd_test_notify() {
     echo ""
     log_info "Sending test notification..."
 
-    local dc_msg="🧪 **Test Notification**
+    local server
+    server=$(_server_name)
 
-✅ Notifications are working!
-🖥 $(_host)"
+    local fields
+    fields=$(jq -n --arg host "$server" \
+        '[{name: "Server", value: $host, inline: true},
+          {name: "Status", value: "Notifications are working", inline: true}]' 2>/dev/null || echo "[]")
 
-    notify_send "🧪 Test" "$dc_msg" "info"
-    log_success "Test notification sent"
+    local payload
+    payload=$(_discord_payload "Test Notification" 5793266 "Sent from **${server}**" "$fields")
+
+    if [[ -n "$payload" ]]; then
+        local discord_enabled
+        discord_enabled=$(config_get '.notifications.discord.enabled' 2>/dev/null || echo "false")
+        if [[ "$discord_enabled" == "true" ]]; then
+            _discord_send "$payload"
+            log_success "Test notification sent"
+        else
+            log_warn "Discord not enabled. Run 'rcloak notify' to configure."
+        fi
+    fi
     echo ""
 }
 
@@ -796,9 +833,10 @@ cmd_sync_db() {
         [[ -z "$remote" ]] && return 1
     fi
 
-    # Build sync path
     remote="${remote%/}"
-    [[ "$remote" == *: ]] && remote="${remote}rcloak-sync/" || remote="${remote}/rcloak-sync/"
+    local sname
+    sname=$(_server_name)
+    [[ "$remote" == *: ]] && remote="${remote}rcloak-sync/${sname}/" || remote="${remote}/rcloak-sync/${sname}/"
 
     echo ""
     log_info "Syncing rcloak data to ${remote}"
@@ -841,9 +879,10 @@ cmd_import_db() {
         [[ -z "$remote" ]] && return 1
     fi
 
-    # Build sync path
     remote="${remote%/}"
-    [[ "$remote" == *: ]] && remote="${remote}rcloak-sync/" || remote="${remote}/rcloak-sync/"
+    local sname
+    sname=$(_server_name)
+    [[ "$remote" == *: ]] && remote="${remote}rcloak-sync/${sname}/" || remote="${remote}/rcloak-sync/${sname}/"
 
     echo ""
     log_info "Importing rcloak data from ${remote}"

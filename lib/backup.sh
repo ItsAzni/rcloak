@@ -187,8 +187,12 @@ _auto_sync_db() {
     [[ -z "$remote" || "$remote" == "null" ]] && remote=$(rclone listremotes 2>/dev/null | head -1 | tr -d ' ')
     [[ -z "$remote" ]] && return 0
 
+    local server
+    server=$(config_get '.server_name // empty' 2>/dev/null || echo "")
+    [[ -z "$server" || "$server" == "null" ]] && server=$(hostname 2>/dev/null || echo "server")
+
     remote="${remote%/}"
-    [[ "$remote" == *: ]] && remote="${remote}rcloak-sync/" || remote="${remote}/rcloak-sync/"
+    [[ "$remote" == *: ]] && remote="${remote}rcloak-sync/${server}/" || remote="${remote}/rcloak-sync/${server}/"
 
     [[ -f "$RCLOAK_DB_FILE" ]] && rclone copy "$RCLOAK_DB_FILE" "${remote}data/" 2>/dev/null
     [[ -f "$RCLOAK_CONFIG_FILE" ]] && rclone copy "$RCLOAK_CONFIG_FILE" "${remote}config/" 2>/dev/null

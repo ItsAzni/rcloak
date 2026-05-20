@@ -1,29 +1,39 @@
 #!/usr/bin/env bash
 
-notify_discord() {
-    local title="$1" message="$2" status="${3:-info}"
+_server_name() {
+    local name
+    name=$(config_get '.server_name // empty' 2>/dev/null || echo "")
+    if [[ -n "$name" && "$name" != "null" && "$name" != "empty" ]]; then
+        echo "$name"
+    else
+        hostname 2>/dev/null || echo "server"
+    fi
+}
+
+_discord_payload() {
+    local title="$1" color="$2" description="$3" fields="${4:-[]}"
+
+    jq -n \
+        --arg title "$title" \
+        --argjson color "$color" \
+        --arg desc "$description" \
+        --argjson fields "$fields" \
+        --arg ts "$(date -Iseconds)" \
+        '{embeds: [{
+            title: $title,
+            color: $color,
+            description: $desc,
+            fields: $fields,
+            footer: {text: "rcloak"},
+            timestamp: $ts
+        }]}' 2>/dev/null
+}
+
+_discord_send() {
+    local payload="$1"
     local webhook_url
     webhook_url=$(config_get '.notifications.discord.webhook_url' 2>/dev/null || echo "")
     [[ -z "$webhook_url" || "$webhook_url" == "null" ]] && return 0
-
-    local color
-    case "$status" in
-        success)  color=5763719 ;;
-        error)    color=15548997 ;;
-        warn)     color=16705372 ;;
-        progress) color=5793266 ;;
-        *)        color=5793266 ;;
-    esac
-
-    local payload
-    payload=$(jq -n \
-        --arg title "$title" \
-        --arg desc "$message" \
-        --argjson color "$color" \
-        --arg ts "$(date -Iseconds)" \
-        --arg footer "⚡ rcloak · $(hostname 2>/dev/null || echo server)" \
-        '{embeds: [{title: $title, description: $desc, color: $color, timestamp: $ts, footer: {text: $footer}}]}' 2>/dev/null) || return 0
-
     curl -s -o /dev/null -H "Content-Type: application/json" -d "$payload" "$webhook_url" &>/dev/null || true
     return 0
 }
@@ -34,89 +44,108 @@ _should_notify() {
     on_success=$(config_get '.notifications.on_success' 2>/dev/null || echo "true")
     on_failure=$(config_get '.notifications.on_failure' 2>/dev/null || echo "true")
     [[ "$status" == "success" && "$on_success" != "true" ]] && return 1
-    [[ "$status" == "error" && "$on_failure" != "true" ]] && return 1
+    [[ "$status" == "error"   && "$on_failure" != "true" ]] && return 1
     return 0
 }
 
-notify_send() {
-    local discord_title="$1" discord_msg="$2" status="${3:-info}"
+notify_send_payload() {
+    local status="$1" payload="$2"
     _should_notify "$status" || return 0
 
     local discord_enabled
     discord_enabled=$(config_get '.notifications.discord.enabled' 2>/dev/null || echo "false")
-
-    if [[ "$discord_enabled" == "true" ]]; then
-        notify_discord "$discord_title" "$discord_msg" "$status" || true
-    fi
+    [[ "$discord_enabled" == "true" ]] && _discord_send "$payload" || true
     return 0
 }
-
-_now_time() { date '+%H:%M' 2>/dev/null || echo ""; }
-_now_date() { date '+%d/%m %H:%M' 2>/dev/null || echo ""; }
-_host()     { hostname 2>/dev/null || echo "server"; }
 
 notify_backup_start() {
     local total_jobs="$1"; shift
     local job_names=("$@")
+    local server
+    server=$(_server_name)
 
-    local dc_jobs=""
-    for j in "${job_names[@]}"; do dc_jobs+="› \`${j}\`
-"; done
+    local jobs_value="" bt='`'
+    for j in "${job_names[@]}"; do
+        [[ -n "$jobs_value" ]] && jobs_value+=$'\n'
+        jobs_value+="${bt}${j}${bt}"
+    done
 
-    local dc="${dc_jobs}
-Started at $(_now_time) · ${total_jobs} job(s)"
+    local fields
+    fields=$(jq -n --arg jobs "$jobs_value" \
+        '[{name: "Jobs", value: $jobs, inline: false}]' 2>/dev/null || echo "[]")
 
-    notify_send "🔄 Backup Started" "$dc" "progress" || true
+    local payload
+    payload=$(_discord_payload \
+        "Backup Started" \
+        5793266 \
+        "Running **${total_jobs}** job(s) on **${server}**" \
+        "$fields")
+
+    [[ -n "$payload" ]] && notify_send_payload "progress" "$payload" || true
     return 0
 }
 
-notify_job_start() {
-    local job_name="$1" source="$2" dest="$3" job_index="$4" total_jobs="$5"
-
-    local dc="\`${job_name}\` → \`${dest}\`
-\`\`\`
-${source}
-\`\`\`"
-
-    notify_send "🔄 Syncing [${job_index}/${total_jobs}]" "$dc" "progress" || true
-    return 0
-}
-
-notify_job_done() { return 0; }
+notify_job_start() { return 0; }
+notify_job_done()  { return 0; }
 
 notify_backup_summary() {
     local total_jobs="$1" success_count="$2" fail_count="$3"
     local total_duration="$4" total_size="${5:-unknown}"
     shift 5
     local job_results=("$@")
+    local server
+    server=$(_server_name)
 
-    local overall_status="success" status_icon="💾" status_text="All backups completed"
-    if [[ $fail_count -gt 0 && $success_count -gt 0 ]]; then
-        overall_status="warn" status_icon="⚠️" status_text="Partial failure"
+    local title color desc overall_status
+    if [[ $fail_count -eq 0 ]]; then
+        title="Backup Complete"
+        color=5763719       # green
+        desc="All **${success_count}** job(s) completed on **${server}**"
+        overall_status="success"
     elif [[ $success_count -eq 0 ]]; then
-        overall_status="error" status_icon="❌" status_text="All backups failed"
+        title="Backup Failed"
+        color=15548997      # red
+        desc="All **${fail_count}** job(s) failed on **${server}**"
+        overall_status="error"
+    else
+        title="Partial Failure"
+        color=16705372      # yellow/orange
+        desc="**${success_count}** succeeded, **${fail_count}** failed on **${server}**"
+        overall_status="warn"
     fi
 
-    local dc_jobs=""
+    local results_json="["
+    local first=true
     for r in "${job_results[@]}"; do
         local rname rstatus rdur rsize
-        rname=$(echo "$r" | cut -d'|' -f1)
+        rname=$(echo "$r"  | cut -d'|' -f1)
         rstatus=$(echo "$r" | cut -d'|' -f2)
-        rdur=$(echo "$r" | cut -d'|' -f3)
-        rsize=$(echo "$r" | cut -d'|' -f4)
-        if [[ "$rstatus" == "success" ]]; then
-            dc_jobs+="✅ \`${rname}\` — ${rsize} in ${rdur}
-"
-        else
-            dc_jobs+="❌ \`${rname}\` — failed after ${rdur}
-"
-        fi
+        rdur=$(echo "$r"   | cut -d'|' -f3)
+        rsize=$(echo "$r"  | cut -d'|' -f4)
+        [[ "$first" == "true" ]] && first=false || results_json+=","
+        results_json+=$(jq -n \
+            --arg name "$rname" --arg status "$rstatus" \
+            --arg dur "$rdur"   --arg size "$rsize" \
+            '{name:$name,status:$status,dur:$dur,size:$size}' 2>/dev/null)
     done
+    results_json+="]"
 
-    local dc="${dc_jobs}
-${success_count} passed · ${fail_count} failed
-${total_duration} · ${total_size}"
+    local fields
+    fields=$(echo "$results_json" | jq \
+        --arg tdur "$total_duration" \
+        --arg tsize "$total_size" \
+        '
+        map(
+            if .status == "success" then
+                {name: .name, value: (.size + " · " + .dur), inline: true}
+            else
+                {name: .name, value: ("Failed after " + .dur), inline: true}
+            end
+        ) + [{name: "Total", value: ($tdur + " · " + $tsize), inline: false}]
+        ' 2>/dev/null || echo "[]")
 
-    notify_send "${status_icon} ${status_text}" "$dc" "$overall_status" || true
+    local payload
+    payload=$(_discord_payload "$title" "$color" "$desc" "$fields")
+    [[ -n "$payload" ]] && notify_send_payload "$overall_status" "$payload" || true
     return 0
 }

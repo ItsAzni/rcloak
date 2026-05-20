@@ -8,6 +8,7 @@ config_init() {
     cat > "$RCLOAK_CONFIG_FILE" << 'JSON'
 {
   "version": "1.0.0",
+  "server_name": "",
   "notifications": {
     "discord": {
       "enabled": false,
